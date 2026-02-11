@@ -481,8 +481,10 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		// Log message reception
 		timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
 		direction := "←"
+		directionStr := "incoming"
 		if msg.Info.IsFromMe {
 			direction = "→"
+			directionStr = "outgoing"
 		}
 
 		// Log based on message type
@@ -491,7 +493,36 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		} else if content != "" {
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
+
+		// Notify life-manager web app about the new message
+		go notifyLifeManager(chatJID, name, sender, content, timestamp, directionStr, msg.Info.Chat.Server == "g.us", mediaType)
 	}
+}
+
+// notifyLifeManager sends a webhook to the life-manager web app when a new message arrives.
+// Runs in a goroutine — fire-and-forget, never blocks message processing.
+func notifyLifeManager(chatJID, chatName, sender, text, timestamp, direction string, isGroup bool, mediaType string) {
+	payload := map[string]interface{}{
+		"jid":       chatJID,
+		"name":      chatName,
+		"sender":    sender,
+		"text":      text,
+		"timestamp": timestamp,
+		"direction": direction,
+		"isGroup":   isGroup,
+		"mediaType": mediaType,
+	}
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Post("http://localhost:3847/api/whatsapp-event", "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		// Life-manager web app not running — silently ignore
+		return
+	}
+	resp.Body.Close()
 }
 
 // DownloadMediaRequest represents the request body for the download media API
