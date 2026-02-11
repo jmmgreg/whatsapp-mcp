@@ -64,9 +64,13 @@ func NewMessageStore() (*MessageStore, error) {
 		CREATE TABLE IF NOT EXISTS chats (
 			jid TEXT PRIMARY KEY,
 			name TEXT,
-			last_message_time TIMESTAMP
+			last_message_time TIMESTAMP,
+			is_archived BOOLEAN DEFAULT 0,
+			is_muted BOOLEAN DEFAULT 0,
+			mute_end_time INTEGER DEFAULT 0,
+			pinned INTEGER DEFAULT 0
 		);
-		
+
 		CREATE TABLE IF NOT EXISTS messages (
 			id TEXT,
 			chat_jid TEXT,
@@ -90,6 +94,17 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	// Migrate: add new columns if they don't exist (for existing databases)
+	migrations := []string{
+		"ALTER TABLE chats ADD COLUMN is_archived BOOLEAN DEFAULT 0",
+		"ALTER TABLE chats ADD COLUMN is_muted BOOLEAN DEFAULT 0",
+		"ALTER TABLE chats ADD COLUMN mute_end_time INTEGER DEFAULT 0",
+		"ALTER TABLE chats ADD COLUMN pinned INTEGER DEFAULT 0",
+	}
+	for _, migration := range migrations {
+		db.Exec(migration) // Ignore errors (column already exists)
+	}
+
 	return &MessageStore{db: db}, nil
 }
 
@@ -101,8 +116,17 @@ func (store *MessageStore) Close() error {
 // Store a chat in the database
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
-		jid, name, lastMessageTime,
+		"INSERT OR REPLACE INTO chats (jid, name, last_message_time, is_archived, is_muted, mute_end_time, pinned) VALUES (?, ?, ?, COALESCE((SELECT is_archived FROM chats WHERE jid = ?), 0), COALESCE((SELECT is_muted FROM chats WHERE jid = ?), 0), COALESCE((SELECT mute_end_time FROM chats WHERE jid = ?), 0), COALESCE((SELECT pinned FROM chats WHERE jid = ?), 0))",
+		jid, name, lastMessageTime, jid, jid, jid, jid,
+	)
+	return err
+}
+
+// StoreChatWithMeta stores a chat with archived/muted/pinned metadata (used during history sync)
+func (store *MessageStore) StoreChatWithMeta(jid, name string, lastMessageTime time.Time, isArchived bool, isMuted bool, muteEndTime uint64, pinned uint32) error {
+	_, err := store.db.Exec(
+		"INSERT OR REPLACE INTO chats (jid, name, last_message_time, is_archived, is_muted, mute_end_time, pinned) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		jid, name, lastMessageTime, isArchived, isMuted, muteEndTime, pinned,
 	)
 	return err
 }
@@ -641,7 +665,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -775,8 +799,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	fmt.Printf("Starting REST API server on %s (localhost only)...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
@@ -800,14 +824,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -905,8 +929,8 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	// Start REST API server on a non-standard port to avoid conflicts
+	startRESTServer(client, messageStore, 8945)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
@@ -973,7 +997,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1012,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
@@ -1028,6 +1052,14 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		// Get appropriate chat name by passing the history sync conversation directly
 		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
 
+		// Extract archived/muted/pinned metadata from conversation
+		isArchived := conversation.GetArchived()
+		muteEndTime := conversation.GetMuteEndTime()
+		pinned := conversation.GetPinned()
+		// Compute isMuted: mute is active if muteEndTime is in the future or is max uint64 (permanent mute)
+		currentEpoch := uint64(time.Now().Unix())
+		isMuted := muteEndTime > currentEpoch || muteEndTime == math.MaxUint64
+
 		// Process messages
 		messages := conversation.Messages
 		if len(messages) > 0 {
@@ -1045,7 +1077,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				continue
 			}
 
-			messageStore.StoreChat(chatJID, name, timestamp)
+			messageStore.StoreChatWithMeta(chatJID, name, timestamp, isArchived, isMuted, muteEndTime, pinned)
 
 			// Store messages
 			for _, msg := range messages {

@@ -8,7 +8,7 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+WHATSAPP_API_BASE_URL = "http://localhost:8945/api"
 
 @dataclass
 class Message:
@@ -29,6 +29,8 @@ class Chat:
     last_message: Optional[str] = None
     last_sender: Optional[str] = None
     last_is_from_me: Optional[bool] = None
+    is_archived: bool = False
+    is_muted: bool = False
 
     @property
     def is_group(self) -> bool:
@@ -321,53 +323,63 @@ def list_chats(
     limit: int = 20,
     page: int = 0,
     include_last_message: bool = True,
-    sort_by: str = "last_active"
+    sort_by: str = "last_active",
+    exclude_archived: bool = True,
+    exclude_muted: bool = False
 ) -> List[Chat]:
     """Get chats matching the specified criteria."""
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
+
         # Build base query
         query_parts = ["""
-            SELECT 
+            SELECT
                 chats.jid,
                 chats.name,
                 chats.last_message_time,
                 messages.content as last_message,
                 messages.sender as last_sender,
-                messages.is_from_me as last_is_from_me
+                messages.is_from_me as last_is_from_me,
+                chats.is_archived,
+                chats.is_muted
             FROM chats
         """]
-        
+
         if include_last_message:
             query_parts.append("""
-                LEFT JOIN messages ON chats.jid = messages.chat_jid 
+                LEFT JOIN messages ON chats.jid = messages.chat_jid
                 AND chats.last_message_time = messages.timestamp
             """)
-            
+
         where_clauses = []
         params = []
-        
+
         if query:
             where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
             params.extend([f"%{query}%", f"%{query}%"])
-            
+
+        if exclude_archived:
+            where_clauses.append("(chats.is_archived = 0 OR chats.is_archived IS NULL)")
+
+        if exclude_muted:
+            where_clauses.append("(chats.is_muted = 0 OR chats.is_muted IS NULL)")
+
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
-            
+
         # Add sorting
         order_by = "chats.last_message_time DESC" if sort_by == "last_active" else "chats.name"
         query_parts.append(f"ORDER BY {order_by}")
-        
+
         # Add pagination
         offset = (page ) * limit
         query_parts.append("LIMIT ? OFFSET ?")
         params.extend([limit, offset])
-        
+
         cursor.execute(" ".join(query_parts), tuple(params))
         chats = cursor.fetchall()
-        
+
         result = []
         for chat_data in chats:
             chat = Chat(
@@ -376,12 +388,14 @@ def list_chats(
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
-                last_is_from_me=chat_data[5]
+                last_is_from_me=chat_data[5],
+                is_archived=bool(chat_data[6]) if chat_data[6] is not None else False,
+                is_muted=bool(chat_data[7]) if chat_data[7] is not None else False
             )
             result.append(chat)
-            
+
         return result
-        
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return []
