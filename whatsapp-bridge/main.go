@@ -31,6 +31,38 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// resolveLID converts an @lid JID to a phone-based @s.whatsapp.net JID if a mapping exists
+// in whatsmeow's LID map. Returns the original string if no mapping is found or if it's not a LID JID.
+func resolveLID(client *whatsmeow.Client, jidStr string) string {
+	if !strings.Contains(jidStr, "@lid") {
+		return jidStr
+	}
+	jid, err := types.ParseJID(jidStr)
+	if err != nil || jid.Server != types.HiddenUserServer {
+		return jidStr
+	}
+	pnJID, err := client.Store.LIDs.GetPNForLID(context.Background(), jid)
+	if err != nil || pnJID.IsEmpty() {
+		return jidStr
+	}
+	return pnJID.String()
+}
+
+// resolveLIDUser resolves a bare LID user string (the part before @lid) to a phone number user string.
+// Used when only the User portion of the JID is stored (e.g., sender fields).
+func resolveLIDUser(client *whatsmeow.Client, user string) string {
+	if user == "" {
+		return user
+	}
+	// Try to build a full LID JID and resolve it
+	lidJID := types.NewJID(user, types.HiddenUserServer)
+	pnJID, err := client.Store.LIDs.GetPNForLID(context.Background(), lidJID)
+	if err != nil || pnJID.IsEmpty() {
+		return user
+	}
+	return pnJID.User
+}
+
 // Message represents a chat message for our client
 type Message struct {
 	Time      time.Time
@@ -434,12 +466,18 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
-	// Save message to database
-	chatJID := msg.Info.Chat.String()
-	sender := msg.Info.Sender.User
+	// Save message to database — resolve @lid JIDs to phone numbers
+	chatJID := resolveLID(client, msg.Info.Chat.String())
+	sender := resolveLIDUser(client, msg.Info.Sender.User)
+
+	// Re-parse the resolved chatJID for GetChatName
+	resolvedJID, _ := types.ParseJID(chatJID)
+	if resolvedJID.IsEmpty() {
+		resolvedJID = msg.Info.Chat
+	}
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
-	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
+	name := GetChatName(client, messageStore, resolvedJID, chatJID, nil, sender, logger)
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
@@ -1071,7 +1109,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			continue
 		}
 
-		chatJID := *conversation.ID
+		chatJID := resolveLID(client, *conversation.ID)
 
 		// Try to parse the JID
 		jid, err := types.ParseJID(chatJID)
@@ -1151,14 +1189,14 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 						isFromMe = *msg.Message.Key.FromMe
 					}
 					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
-						sender = *msg.Message.Key.Participant
+						sender = resolveLID(client, *msg.Message.Key.Participant)
 					} else if isFromMe {
 						sender = client.Store.ID.User
 					} else {
-						sender = jid.User
+						sender = resolveLIDUser(client, jid.User)
 					}
 				} else {
-					sender = jid.User
+					sender = resolveLIDUser(client, jid.User)
 				}
 
 				// Store message
