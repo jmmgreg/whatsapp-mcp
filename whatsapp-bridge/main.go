@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"math"
 	"math/rand"
@@ -64,9 +65,11 @@ func NewMessageStore() (*MessageStore, error) {
 		CREATE TABLE IF NOT EXISTS chats (
 			jid TEXT PRIMARY KEY,
 			name TEXT,
-			last_message_time TIMESTAMP
+			last_message_time TIMESTAMP,
+			is_archived BOOLEAN DEFAULT 0,
+			is_muted BOOLEAN DEFAULT 0
 		);
-		
+
 		CREATE TABLE IF NOT EXISTS messages (
 			id TEXT,
 			chat_jid TEXT,
@@ -90,6 +93,16 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	// Forward-compat migration: add is_archived / is_muted if running against
+	// a pre-existing DB created by an older bridge. SQLite errors if the
+	// column already exists — that's the expected no-op case on fresh DBs.
+	for _, stmt := range []string{
+		"ALTER TABLE chats ADD COLUMN is_archived BOOLEAN DEFAULT 0",
+		"ALTER TABLE chats ADD COLUMN is_muted BOOLEAN DEFAULT 0",
+	} {
+		_, _ = db.Exec(stmt)
+	}
+
 	return &MessageStore{db: db}, nil
 }
 
@@ -98,11 +111,28 @@ func (store *MessageStore) Close() error {
 	return store.db.Close()
 }
 
-// Store a chat in the database
+// Store a chat in the database. Preserves any existing is_archived / is_muted
+// flags — live messages don't carry that metadata, only history sync does, so
+// we COALESCE with the current row to avoid clobbering archive/mute state.
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
-		jid, name, lastMessageTime,
+		`INSERT OR REPLACE INTO chats (jid, name, last_message_time, is_archived, is_muted)
+		 VALUES (
+		   ?, ?, ?,
+		   COALESCE((SELECT is_archived FROM chats WHERE jid = ?), 0),
+		   COALESCE((SELECT is_muted    FROM chats WHERE jid = ?), 0)
+		 )`,
+		jid, name, lastMessageTime, jid, jid,
+	)
+	return err
+}
+
+// StoreChatWithMeta stores a chat row with explicit archive/mute flags,
+// used from history sync where whatsmeow gives us the real state.
+func (store *MessageStore) StoreChatWithMeta(jid, name string, lastMessageTime time.Time, archived, muted bool) error {
+	_, err := store.db.Exec(
+		"INSERT OR REPLACE INTO chats (jid, name, last_message_time, is_archived, is_muted) VALUES (?, ?, ?, ?, ?)",
+		jid, name, lastMessageTime, archived, muted,
 	)
 	return err
 }
@@ -408,11 +438,29 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	return "", "", "", nil, nil, nil, 0
 }
 
-// Handle regular incoming messages with media support
-func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
+// Handle regular incoming messages with media support.
+// filter may be nil (filtering disabled); the Matches call is safe on nil.
+func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, filter *FilterConfig, msg *events.Message, logger waLog.Logger) {
 	// Save message to database
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
+
+	// Filter: drop silently if this chat is explicitly ignored, or if it's
+	// flagged archived/muted in the DB and the filter wants those dropped.
+	if filter != nil {
+		if filter.Matches(chatJID) {
+			return
+		}
+		if filter.shouldCheckMeta() {
+			var archived, muted bool
+			row := messageStore.db.QueryRow("SELECT is_archived, is_muted FROM chats WHERE jid = ?", chatJID)
+			if err := row.Scan(&archived, &muted); err == nil {
+				if filter.MatchesChatMeta(chatJID, archived, muted) {
+					return
+				}
+			}
+		}
+	}
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
@@ -676,7 +724,38 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, filter *FilterConfig, port int) {
+	// GET /api/filter — return the current ignore snapshot. 404 if no filter configured.
+	http.HandleFunc("/api/filter", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if filter == nil {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "filter not configured"})
+			return
+		}
+		json.NewEncoder(w).Encode(filter.Snapshot())
+	})
+
+	// POST /api/filter/reload — re-read the filter file without restarting.
+	http.HandleFunc("/api/filter/reload", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if filter == nil {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "filter not configured"})
+			return
+		}
+		if err := filter.Reload(); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(filter.Snapshot())
+	})
+
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -787,9 +866,30 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 }
 
 func main() {
+	// Parse CLI flags
+	ignoreConfigFlag := flag.String("ignore-config", "", "Optional JSON file with ignore rules (overrides $IGNORE_CONFIG_PATH)")
+	flag.Parse()
+
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
+
+	// Optional ignore filter. Path precedence: --ignore-config, then
+	// $IGNORE_CONFIG_PATH, then nothing (filtering disabled).
+	ignorePath := *ignoreConfigFlag
+	if ignorePath == "" {
+		ignorePath = os.Getenv("IGNORE_CONFIG_PATH")
+	}
+	filter, err := newFilterConfig(ignorePath)
+	if err != nil {
+		logger.Errorf("Invalid ignore config: %v", err)
+		return
+	}
+	if filter != nil {
+		snap := filter.Snapshot()
+		logger.Infof("Ignore filter loaded from %s (archived=%v muted=%v jids=%d)",
+			ignorePath, snap.IgnoreArchived, snap.IgnoreMuted, len(snap.IgnoredJIDs))
+	}
 
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
@@ -839,11 +939,11 @@ func main() {
 		switch v := evt.(type) {
 		case *events.Message:
 			// Process regular messages
-			handleMessage(client, messageStore, v, logger)
+			handleMessage(client, messageStore, filter, v, logger)
 
 		case *events.HistorySync:
 			// Process history sync events
-			handleHistorySync(client, messageStore, v, logger)
+			handleHistorySync(client, messageStore, filter, v, logger)
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
@@ -906,7 +1006,7 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	startRESTServer(client, messageStore, filter, 8080)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
@@ -1005,8 +1105,9 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	return name
 }
 
-// Handle history sync events
-func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
+// Handle history sync events.
+// filter may be nil (filtering disabled); Matches/MatchesChatMeta are safe on nil.
+func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, filter *FilterConfig, historySync *events.HistorySync, logger waLog.Logger) {
 	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
 
 	syncedCount := 0
@@ -1022,6 +1123,17 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		jid, err := types.ParseJID(chatJID)
 		if err != nil {
 			logger.Warnf("Failed to parse JID %s: %v", chatJID, err)
+			continue
+		}
+
+		// Extract archive/mute metadata from the conversation so we can both
+		// (a) honor the filter for this chat and (b) persist the state for
+		// future live-message filtering.
+		archived := conversation.GetArchived()
+		muted := conversation.GetMuteEndTime() != 0
+
+		// Filter: drop conversation wholesale if it matches any rule.
+		if filter.MatchesChatMeta(chatJID, archived, muted) {
 			continue
 		}
 
@@ -1045,7 +1157,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				continue
 			}
 
-			messageStore.StoreChat(chatJID, name, timestamp)
+			messageStore.StoreChatWithMeta(chatJID, name, timestamp, archived, muted)
 
 			// Store messages
 			for _, msg := range messages {
