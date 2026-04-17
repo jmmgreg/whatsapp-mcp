@@ -440,8 +440,9 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	return "", "", "", nil, nil, nil, 0
 }
 
-// Handle regular incoming messages with media support
-func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
+// Handle regular incoming messages with media support.
+// webhookCfg may be nil (webhooks disabled); Fire() is a no-op in that case.
+func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, webhookCfg *WebhookConfig, msg *events.Message, logger waLog.Logger) {
 	// Save message to database — always store fully-qualified JIDs (and resolve
 	// @lid JIDs to their phone-based form) so chat/sender keys stay consistent
 	// across handleMessage and handleHistorySync.
@@ -501,6 +502,21 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		} else if content != "" {
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
+
+		// Notify optional webhook. Non-blocking and safe to call when webhookCfg is nil.
+		webhookDirection := "incoming"
+		if msg.Info.IsFromMe {
+			webhookDirection = "outgoing"
+		}
+		webhookCfg.Fire(WebhookPayload{
+			ChatJID:   chatJID,
+			Sender:    sender,
+			Text:      content,
+			Timestamp: msg.Info.Timestamp,
+			Direction: webhookDirection,
+			IsGroup:   msg.Info.IsGroup,
+			MediaType: mediaType,
+		})
 	}
 }
 
@@ -839,13 +855,30 @@ func resolvePort(portFlag int, portEnv string, defaultPort int) int {
 func main() {
 	// Parse CLI flags
 	portFlag := flag.Int("port", 0, "HTTP port for the REST API server (overrides $PORT; default 8080)")
+	webhookURLFlag := flag.String("webhook-url", "", "Optional URL to POST live message events to (overrides $WEBHOOK_URL)")
 	flag.Parse()
 
 	port := resolvePort(*portFlag, os.Getenv("PORT"), 8080)
 
+
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
+
+	// Optional live-event webhook. If unset, Fire() becomes a no-op at every call site.
+	webhookCfg, err := newWebhookConfig(
+		*webhookURLFlag,
+		os.Getenv("WEBHOOK_URL"),
+		os.Getenv("WEBHOOK_TIMEOUT_SECONDS"),
+		os.Getenv("WEBHOOK_HEADERS"),
+	)
+	if err != nil {
+		logger.Errorf("Invalid webhook config: %v", err)
+		return
+	}
+	if webhookCfg != nil {
+		logger.Infof("Webhook enabled: %s (timeout %s)", webhookCfg.URL, webhookCfg.Timeout)
+	}
 
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
@@ -895,7 +928,7 @@ func main() {
 		switch v := evt.(type) {
 		case *events.Message:
 			// Process regular messages
-			handleMessage(client, messageStore, v, logger)
+			handleMessage(client, messageStore, webhookCfg, v, logger)
 
 		case *events.HistorySync:
 			// Process history sync events
