@@ -10,8 +10,8 @@ import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
 # whatsmeow's own database — holds the `whatsmeow_contacts` table the bridge
-# never copies into messages.db. We attach it read-only to resolve sender
-# names without having to keep two copies of the contact store in sync.
+# never copies into messages.db. We attach it read-only to resolve sender and
+# caller names without having to keep two copies of the contact store in sync.
 WHATSMEOW_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
 
 
@@ -163,6 +163,26 @@ class MessageContext:
     message: Message
     before: List[Message]
     after: List[Message]
+
+@dataclass
+class Call:
+    """A WhatsApp voice or video call record.
+
+    `result` is one of: connected, missed, rejected, cancelled, accepted_elsewhere,
+    failed, abandoned, ongoing, invalid, unavailable, upcoming, ringing, unknown.
+    The "ringing" value comes only from live events before the call terminates;
+    a subsequent history sync overwrites it with the authoritative result.
+    """
+    id: str
+    chat_jid: str
+    from_jid: str
+    timestamp: datetime
+    duration_sec: int
+    is_incoming: bool
+    is_video: bool
+    is_group: bool
+    result: str
+    from_name: Optional[str] = None  # Resolved via the whatsmeow contact JOIN
 
 def get_sender_name(sender_jid: str) -> str:
     """Resolve a sender JID to a human-readable display name.
@@ -566,6 +586,121 @@ def list_chats(
     finally:
         if 'conn' in locals():
             conn.close()
+
+
+def list_calls(
+    after: Optional[str] = None,
+    before: Optional[str] = None,
+    chat_jid: Optional[str] = None,
+    missed_only: bool = False,
+    limit: int = 50,
+    page: int = 0,
+) -> List[Call]:
+    """Return voice/video call records.
+
+    Args:
+        after / before: ISO-8601 timestamps; inclusive of `after`, exclusive of
+            `before` (matches list_messages semantics).
+        chat_jid: restrict to calls in a single chat (1:1 counterparty JID or
+            group JID).
+        missed_only: if True, only rows where result='missed'.
+        limit, page: pagination (default 50 per page).
+
+    Each record includes `from_name`, resolved via whatsmeow_contacts when
+    available, so callers don't need a second lookup to render a readable
+    caller name.
+    """
+    try:
+        conn, contacts_ok = _connect_with_contacts()
+        cursor = conn.cursor()
+
+        # from_name here resolves the OTHER party (chat_jid), not the caller —
+        # for outgoing calls the caller is Jean himself, which isn't useful to
+        # display. chat_jid is the conversation JID (callee for outgoing,
+        # caller for incoming), which matches how users think about "who
+        # this call is with."
+        if contacts_ok:
+            name_expr = """COALESCE(
+                NULLIF(wc.full_name,  ''),
+                NULLIF(wc.first_name, ''),
+                NULLIF(sc.name,       ''),
+                NULLIF(wc.push_name,  ''),
+                calls.chat_jid
+            )"""
+            joins = """
+                LEFT JOIN wa.whatsmeow_contacts wc ON wc.their_jid = calls.chat_jid
+                LEFT JOIN chats sc ON sc.jid = calls.chat_jid
+            """
+        else:
+            name_expr = "COALESCE(NULLIF(sc.name, ''), calls.chat_jid)"
+            joins = "LEFT JOIN chats sc ON sc.jid = calls.chat_jid"
+
+        where, params = [], []
+        if after:
+            try:
+                where.append("calls.timestamp >= ?")
+                params.append(datetime.fromisoformat(after))
+            except ValueError:
+                raise ValueError(f"Invalid ISO-8601 for 'after': {after}")
+        if before:
+            try:
+                where.append("calls.timestamp < ?")
+                params.append(datetime.fromisoformat(before))
+            except ValueError:
+                raise ValueError(f"Invalid ISO-8601 for 'before': {before}")
+        if chat_jid:
+            where.append("calls.chat_jid = ?")
+            params.append(chat_jid)
+        if missed_only:
+            where.append("calls.result = 'missed'")
+
+        sql = f"""
+            SELECT calls.id, calls.chat_jid, calls.from_jid, calls.timestamp,
+                   calls.duration_sec, calls.is_incoming, calls.is_video,
+                   calls.is_group, calls.result, {name_expr} AS from_name
+            FROM calls
+            {joins}
+        """
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY calls.timestamp DESC LIMIT ? OFFSET ?"
+        params.extend([limit, page * limit])
+
+        cursor.execute(sql, tuple(params))
+        result: List[Call] = []
+        for row in cursor.fetchall():
+            result.append(Call(
+                id=row[0], chat_jid=row[1], from_jid=row[2],
+                timestamp=datetime.fromisoformat(row[3]) if isinstance(row[3], str) else row[3],
+                duration_sec=row[4] or 0,
+                is_incoming=bool(row[5]),
+                is_video=bool(row[6]),
+                is_group=bool(row[7]),
+                result=row[8] or "unknown",
+                from_name=row[9],
+            ))
+        return result
+    except sqlite3.Error as e:
+        print(f"Database error in list_calls: {e}")
+        return []
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+
+def format_calls_list(calls: List[Call]) -> str:
+    """Render a list of Call records in the same style as format_messages_list."""
+    if not calls:
+        return "No calls to display."
+    out = []
+    for c in calls:
+        direction = "←" if c.is_incoming else "→"
+        media = "video" if c.is_video else "voice"
+        dur = f"{c.duration_sec}s" if c.duration_sec else ""
+        name = c.from_name or c.from_jid
+        ts = c.timestamp.strftime("%Y-%m-%d %H:%M:%S") if isinstance(c.timestamp, datetime) else str(c.timestamp)
+        out.append(f"[{ts}] {direction} {name} ({media}, {c.result}{' ' + dur if dur else ''})")
+    return "\n".join(out)
 
 
 def search_contacts(query: str) -> List[Contact]:

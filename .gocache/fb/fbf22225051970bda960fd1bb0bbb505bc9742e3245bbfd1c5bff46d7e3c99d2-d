@@ -1,0 +1,9 @@
+./ChainState.go
+./Doc.go
+./PendingKeyExchangeState.go
+./PendingPreKeyState.go
+./PreKeyRecord.go
+./SessionRecord.go
+./SessionState.go
+./SignedPreKeyRecord.go
+./UnacknowledgedPreKey.go

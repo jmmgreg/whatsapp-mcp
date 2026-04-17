@@ -1,0 +1,6 @@
+./decode.go
+./encode.go
+./errors.go
+./hash.go
+./keys.go
+./recovery.go

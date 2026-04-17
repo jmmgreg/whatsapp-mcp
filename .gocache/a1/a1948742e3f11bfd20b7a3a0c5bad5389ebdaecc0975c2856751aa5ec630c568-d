@@ -1,0 +1,7 @@
+./call.go
+./group.go
+./jid.go
+./message.go
+./newsletter.go
+./presence.go
+./user.go

@@ -1,0 +1,8 @@
+./Curve.go
+./DjbECPublicKey.go
+./DkbECPrivateKey.go
+./Doc.go
+./ECKeyPair.go
+./ECPrivateKey.go
+./ECPublicKey.go
+./SignCurve25519.go
