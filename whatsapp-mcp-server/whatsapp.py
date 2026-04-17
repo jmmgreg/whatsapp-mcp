@@ -8,7 +8,58 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+# whatsmeow's own database — holds the `whatsmeow_contacts` table the bridge
+# never copies into messages.db. We attach it read-only to resolve sender
+# names without having to keep two copies of the contact store in sync.
+WHATSMEOW_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+
+
+def _connect_with_contacts() -> Tuple[sqlite3.Connection, bool]:
+    """Open messages.db and try to ATTACH whatsmeow.db as schema `wa`.
+
+    Returns (connection, contacts_available). When contacts are not
+    available (whatsmeow.db missing/locked/old schema), callers skip the
+    LEFT JOIN and fall back to the pre-existing chats.name / JID path so
+    everything still works with only messages.db present.
+    """
+    conn = sqlite3.connect(MESSAGES_DB_PATH)
+    contacts_available = False
+    if os.path.exists(WHATSMEOW_DB_PATH):
+        try:
+            conn.execute("ATTACH DATABASE ? AS wa", (WHATSMEOW_DB_PATH,))
+            conn.execute("SELECT 1 FROM wa.whatsmeow_contacts LIMIT 1")
+            contacts_available = True
+        except sqlite3.Error:
+            pass
+    return conn, contacts_available
+
+
+# SQL expression that resolves a sender JID to a display name.
+# Priority (per Jean's spec):
+#   full_name (address book) > first_name (address book) > chats.name
+#   > push_name (self-assigned WhatsApp name) > JID
+# NULLIF('', '') → NULL so empty-string columns fall through to the next choice.
+_WITH_CONTACTS_NAME_EXPR = """COALESCE(
+    NULLIF(wc.full_name,  ''),
+    NULLIF(wc.first_name, ''),
+    NULLIF({chat_name},   ''),
+    NULLIF(wc.push_name,  ''),
+    {sender}
+)"""
+
+_WITHOUT_CONTACTS_NAME_EXPR = "COALESCE(NULLIF({chat_name}, ''), {sender})"
+
+
+def _sender_name_expr(contacts_available: bool, sender_col: str, chat_name_col: str) -> str:
+    """Render the SQL expression used to derive `sender_name` in list queries.
+
+    Parameters let callers use this with different column aliases — e.g.
+    `messages.sender` vs `last_msg.sender` in list_chats.
+    """
+    tpl = _WITH_CONTACTS_NAME_EXPR if contacts_available else _WITHOUT_CONTACTS_NAME_EXPR
+    return tpl.format(sender=sender_col, chat_name=chat_name_col)
+
 
 @dataclass
 class Message:
@@ -20,6 +71,7 @@ class Message:
     id: str
     chat_name: Optional[str] = None
     media_type: Optional[str] = None
+    sender_name: Optional[str] = None  # Resolved per _sender_name_expr priority
 
 @dataclass
 class Chat:
@@ -28,6 +80,7 @@ class Chat:
     last_message_time: Optional[datetime]
     last_message: Optional[str] = None
     last_sender: Optional[str] = None
+    last_sender_name: Optional[str] = None  # Resolved per _sender_name_expr priority
     last_is_from_me: Optional[bool] = None
 
     @property
@@ -48,47 +101,60 @@ class MessageContext:
     after: List[Message]
 
 def get_sender_name(sender_jid: str) -> str:
+    """Resolve a sender JID to a human-readable display name.
+
+    Priority:
+      1. whatsmeow_contacts.full_name  (from the phone's address book)
+      2. whatsmeow_contacts.first_name (also address book)
+      3. chats.name                    (only populated for direct chats &
+                                        group names — so this helps when the
+                                        JID is a direct-chat counterparty)
+      4. whatsmeow_contacts.push_name  (the name the user set on their own WA)
+      5. sender_jid                    (last-resort fallback)
+
+    Each COALESCE step ignores empty strings, so a row where the higher-
+    priority column is set to '' falls through correctly.
+    """
+    conn = None
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn, contacts_available = _connect_with_contacts()
         cursor = conn.cursor()
-        
-        # First try matching by exact JID
-        cursor.execute("""
-            SELECT name
-            FROM chats
-            WHERE jid = ?
-            LIMIT 1
-        """, (sender_jid,))
-        
-        result = cursor.fetchone()
-        
-        # If no result, try looking for the number within JIDs
-        if not result:
-            # Extract the phone number part if it's a JID
-            if '@' in sender_jid:
-                phone_part = sender_jid.split('@')[0]
-            else:
-                phone_part = sender_jid
-                
-            cursor.execute("""
-                SELECT name
-                FROM chats
-                WHERE jid LIKE ?
+
+        if contacts_available:
+            cursor.execute(
+                """
+                SELECT COALESCE(
+                    NULLIF(wc.full_name,  ''),
+                    NULLIF(wc.first_name, ''),
+                    NULLIF(c.name,        ''),
+                    NULLIF(wc.push_name,  ''),
+                    ?
+                )
+                FROM (SELECT ? AS jid) AS q
+                LEFT JOIN wa.whatsmeow_contacts wc ON wc.their_jid = q.jid
+                LEFT JOIN chats c                 ON c.jid         = q.jid
                 LIMIT 1
-            """, (f"%{phone_part}%",))
-            
-            result = cursor.fetchone()
-        
-        if result and result[0]:
-            return result[0]
+                """,
+                (sender_jid, sender_jid),
+            )
         else:
-            return sender_jid
-        
+            # Backwards-compatible path: whatsmeow.db unavailable, fall back
+            # to the old chats-only lookup so the MCP still returns something
+            # sensible in a messages-only deployment.
+            cursor.execute(
+                "SELECT name FROM chats WHERE jid = ? LIMIT 1",
+                (sender_jid,),
+            )
+
+        row = cursor.fetchone()
+        if row and row[0]:
+            return row[0]
+        return sender_jid
     except sqlite3.Error as e:
         print(f"Database error while getting sender name: {e}")
         return sender_jid
     finally:
-        if 'conn' in locals():
+        if conn is not None:
             conn.close()
 
 def format_message(message: Message, show_chat_info: bool = True) -> None:
@@ -105,7 +171,14 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
         content_prefix = f"[{message.media_type} - Message ID: {message.id} - Chat JID: {message.chat_jid}] "
     
     try:
-        sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
+        if message.is_from_me:
+            sender_name = "Me"
+        elif message.sender_name:
+            # list_messages already resolved this via the whatsmeow JOIN —
+            # don't re-query per message.
+            sender_name = message.sender_name
+        else:
+            sender_name = get_sender_name(message.sender)
         output += f"From: {sender_name}: {content_prefix}{message.content}\n"
     except Exception as e:
         print(f"Error formatting message: {e}")
@@ -135,12 +208,24 @@ def list_messages(
 ) -> List[Message]:
     """Get messages matching the specified criteria with optional context."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn, contacts_available = _connect_with_contacts()
         cursor = conn.cursor()
-        
-        # Build base query
-        query_parts = ["SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type FROM messages"]
-        query_parts.append("JOIN chats ON messages.chat_jid = chats.jid")
+
+        # Build base query. sender_name is derived via a COALESCE chain over
+        # the whatsmeow contact store + a *separate* chats lookup keyed by the
+        # sender JID — we can't reuse the outer `chats` join because that's
+        # keyed by the chat JID (which is the group for group messages, not
+        # the person). sender_chat.name is non-null for direct-chat people.
+        sender_name_sql = _sender_name_expr(contacts_available, "messages.sender", "sender_chat.name")
+        query_parts = [
+            f"SELECT messages.timestamp, messages.sender, chats.name, messages.content, "
+            f"messages.is_from_me, chats.jid, messages.id, messages.media_type, "
+            f"{sender_name_sql} AS sender_name FROM messages",
+            "JOIN chats ON messages.chat_jid = chats.jid",
+            "LEFT JOIN chats sender_chat ON sender_chat.jid = messages.sender",
+        ]
+        if contacts_available:
+            query_parts.append("LEFT JOIN wa.whatsmeow_contacts wc ON wc.their_jid = messages.sender")
         where_clauses = []
         params = []
         
@@ -197,7 +282,8 @@ def list_messages(
                 is_from_me=msg[4],
                 chat_jid=msg[5],
                 id=msg[6],
-                media_type=msg[7]
+                media_type=msg[7],
+                sender_name=msg[8]
             )
             result.append(message)
             
@@ -325,26 +411,43 @@ def list_chats(
 ) -> List[Chat]:
     """Get chats matching the specified criteria."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn, contacts_available = _connect_with_contacts()
         cursor = conn.cursor()
-        
-        # Build base query
-        query_parts = ["""
-            SELECT 
+
+        # Derive last_sender_name via the same priority chain list_messages
+        # uses. When the last-message JOIN isn't present (include_last_message
+        # False), there's no sender to resolve — last_sender_name stays NULL.
+        # sender_chat is a *separate* alias into chats keyed by the sender
+        # JID (not the group JID) so direct-chat contacts still fall back
+        # correctly when no whatsmeow row exists.
+        last_sender_name_sql = (
+            _sender_name_expr(contacts_available, "messages.sender", "sender_chat.name")
+            if include_last_message else "NULL"
+        )
+        query_parts = [f"""
+            SELECT
                 chats.jid,
                 chats.name,
                 chats.last_message_time,
                 messages.content as last_message,
                 messages.sender as last_sender,
-                messages.is_from_me as last_is_from_me
+                messages.is_from_me as last_is_from_me,
+                {last_sender_name_sql} as last_sender_name
             FROM chats
         """]
-        
+
         if include_last_message:
             query_parts.append("""
-                LEFT JOIN messages ON chats.jid = messages.chat_jid 
+                LEFT JOIN messages ON chats.jid = messages.chat_jid
                 AND chats.last_message_time = messages.timestamp
             """)
+            query_parts.append(
+                "LEFT JOIN chats sender_chat ON sender_chat.jid = messages.sender"
+            )
+            if contacts_available:
+                query_parts.append(
+                    "LEFT JOIN wa.whatsmeow_contacts wc ON wc.their_jid = messages.sender"
+                )
             
         where_clauses = []
         params = []
@@ -376,12 +479,13 @@ def list_chats(
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
-                last_is_from_me=chat_data[5]
+                last_is_from_me=chat_data[5],
+                last_sender_name=chat_data[6] if len(chat_data) > 6 else None
             )
             result.append(chat)
-            
+
         return result
-        
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return []
@@ -441,26 +545,34 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         page: Page number for pagination (default 0)
     """
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn, contacts_available = _connect_with_contacts()
         cursor = conn.cursor()
-        
-        cursor.execute("""
+
+        # sender_chat keyed on the sender JID (not c.jid, which is the group)
+        # so fallback to chats.name works for direct-chat counterparties.
+        last_sender_name_sql = _sender_name_expr(contacts_available, "m.sender", "sender_chat.name")
+        join_wc = "LEFT JOIN wa.whatsmeow_contacts wc ON wc.their_jid = m.sender" if contacts_available else ""
+
+        cursor.execute(f"""
             SELECT DISTINCT
                 c.jid,
                 c.name,
                 c.last_message_time,
                 m.content as last_message,
                 m.sender as last_sender,
-                m.is_from_me as last_is_from_me
+                m.is_from_me as last_is_from_me,
+                {last_sender_name_sql} as last_sender_name
             FROM chats c
             JOIN messages m ON c.jid = m.chat_jid
+            LEFT JOIN chats sender_chat ON sender_chat.jid = m.sender
+            {join_wc}
             WHERE m.sender = ? OR c.jid = ?
             ORDER BY c.last_message_time DESC
             LIMIT ? OFFSET ?
         """, (jid, jid, limit, page * limit))
-        
+
         chats = cursor.fetchall()
-        
+
         result = []
         for chat_data in chats:
             chat = Chat(
@@ -469,10 +581,12 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
-                last_is_from_me=chat_data[5]
+                last_is_from_me=chat_data[5],
+                last_sender_name=chat_data[6]
             )
             result.append(chat)
-            
+
+
         return result
         
     except sqlite3.Error as e:
