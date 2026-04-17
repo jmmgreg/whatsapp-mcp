@@ -1,3 +1,4 @@
+import os
 import sqlite3
 from datetime import datetime
 from dataclasses import dataclass
@@ -8,7 +9,19 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+
+# Bridge REST API URL. Honors WHATSAPP_API_BASE_URL (full URL) or WHATSAPP_BRIDGE_PORT
+# (port only, assumes localhost). Default: http://localhost:8080/api.
+def _resolve_bridge_url() -> str:
+    full = os.environ.get("WHATSAPP_API_BASE_URL", "").strip()
+    if full:
+        return full.rstrip("/")
+    port = os.environ.get("WHATSAPP_BRIDGE_PORT", "").strip()
+    if port and port.isdigit() and int(port) > 0:
+        return f"http://localhost:{port}/api"
+    return "http://localhost:8080/api"
+
+WHATSAPP_API_BASE_URL = _resolve_bridge_url()
 
 @dataclass
 class Message:

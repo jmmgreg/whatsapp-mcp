@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"math"
 	"math/rand"
@@ -13,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -786,7 +788,29 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	}()
 }
 
+// resolvePort returns the HTTP server port based on the following precedence:
+//  1. Non-zero portFlag (from --port)
+//  2. portEnv (from the PORT environment variable), if non-empty and a valid positive integer
+//  3. defaultPort otherwise
+func resolvePort(portFlag int, portEnv string, defaultPort int) int {
+	if portFlag != 0 {
+		return portFlag
+	}
+	if portEnv != "" {
+		if p, err := strconv.Atoi(portEnv); err == nil && p > 0 {
+			return p
+		}
+	}
+	return defaultPort
+}
+
 func main() {
+	// Parse CLI flags
+	portFlag := flag.Int("port", 0, "HTTP port for the REST API server (overrides $PORT; default 8080)")
+	flag.Parse()
+
+	port := resolvePort(*portFlag, os.Getenv("PORT"), 8080)
+
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
@@ -906,7 +930,7 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	startRESTServer(client, messageStore, port)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
