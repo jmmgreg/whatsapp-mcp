@@ -4,6 +4,8 @@ from whatsapp import (
     search_contacts as whatsapp_search_contacts,
     list_messages as whatsapp_list_messages,
     list_chats as whatsapp_list_chats,
+    list_calls as whatsapp_list_calls,
+    format_calls_list as whatsapp_format_calls_list,
     get_chat as whatsapp_get_chat,
     get_direct_chat_by_contact as whatsapp_get_direct_chat_by_contact,
     get_contact_chats as whatsapp_get_contact_chats,
@@ -94,6 +96,37 @@ def list_chats(
         sort_by=sort_by
     )
     return chats
+
+@mcp.tool()
+def list_calls(
+    after: Optional[str] = None,
+    before: Optional[str] = None,
+    chat_jid: Optional[str] = None,
+    missed_only: bool = False,
+    limit: int = 50,
+    page: int = 0,
+) -> str:
+    """List WhatsApp voice/video call records with resolved caller names.
+
+    Returns a formatted multi-line string, one call per line:
+      [YYYY-MM-DD HH:MM:SS] ← Caller Name (voice/video, result [, Ns duration])
+
+    Call results: connected, missed, rejected, cancelled, failed, ringing, …
+
+    Args:
+        after: ISO-8601 timestamp; include calls at/after this time.
+        before: ISO-8601 timestamp; include calls strictly before this time.
+        chat_jid: Restrict to a single chat (1:1 counterparty JID or group JID).
+        missed_only: If True, return only calls Jean didn't answer.
+        limit: Max calls to return (default 50).
+        page: Pagination offset (default 0).
+    """
+    calls = whatsapp_list_calls(
+        after=after, before=before, chat_jid=chat_jid,
+        missed_only=missed_only, limit=limit, page=page,
+    )
+    return whatsapp_format_calls_list(calls)
+
 
 @mcp.tool()
 def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]:

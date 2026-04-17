@@ -1,0 +1,8 @@
+./CiphertextMessage.go
+./Doc.go
+./PreKeySignalMessage.go
+./SenderKeyDistributionMessage.go
+./SenderKeyMessage.go
+./SenderKeyName.go
+./SignalMessage.go
+./SignalProtocolAddress.go

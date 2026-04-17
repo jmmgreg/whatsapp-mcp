@@ -1,0 +1,33 @@
+# runtime/cgo
+cc: error: couldn't create cache file '/var/folders/vx/w1k_44hj3_x7r7hcd0slm24m0000gn/T/xcrun_db-9k3WPYSs' (errno=Operation not permitted)
+cc: error: couldn't create cache file '/var/folders/vx/w1k_44hj3_x7r7hcd0slm24m0000gn/T/xcrun_db-EOPQYix8' (errno=Operation not permitted)
+# runtime/cgo
+cc: error: couldn't create cache file '/var/folders/vx/w1k_44hj3_x7r7hcd0slm24m0000gn/T/xcrun_db-qFyPKR5W' (errno=Operation not permitted)
+cc: error: couldn't create cache file '/var/folders/vx/w1k_44hj3_x7r7hcd0slm24m0000gn/T/xcrun_db-521PtBJx' (errno=Operation not permitted)
+# runtime/cgo
+cc: error: couldn't create cache file '/var/folders/vx/w1k_44hj3_x7r7hcd0slm24m0000gn/T/xcrun_db-LFZKSJbP' (errno=Operation not permitted)
+cc: error: couldn't create cache file '/var/folders/vx/w1k_44hj3_x7r7hcd0slm24m0000gn/T/xcrun_db-edo8a8BG' (errno=Operation not permitted)
+# runtime/cgo
+cc: error: couldn't create cache file '/var/folders/vx/w1k_44hj3_x7r7hcd0slm24m0000gn/T/xcrun_db-v1PVYq9k' (errno=Operation not permitted)
+cc: error: couldn't create cache file '/var/folders/vx/w1k_44hj3_x7r7hcd0slm24m0000gn/T/xcrun_db-NzskKqZS' (errno=Operation not permitted)
+# runtime/cgo
+cc: error: couldn't create cache file '/var/folders/vx/w1k_44hj3_x7r7hcd0slm24m0000gn/T/xcrun_db-yzBBr6ON' (errno=Operation not permitted)
+cc: error: couldn't create cache file '/var/folders/vx/w1k_44hj3_x7r7hcd0slm24m0000gn/T/xcrun_db-HL25BBGJ' (errno=Operation not permitted)
+# runtime/cgo
+cc: error: couldn't create cache file '/var/folders/vx/w1k_44hj3_x7r7hcd0slm24m0000gn/T/xcrun_db-21Vbhqd1' (errno=Operation not permitted)
+cc: error: couldn't create cache file '/var/folders/vx/w1k_44hj3_x7r7hcd0slm24m0000gn/T/xcrun_db-TmOpb5AG' (errno=Operation not permitted)
+# runtime/cgo
+cc: error: couldn't create cache file '/var/folders/vx/w1k_44hj3_x7r7hcd0slm24m0000gn/T/xcrun_db-cn0sHNjc' (errno=Operation not permitted)
+cc: error: couldn't create cache file '/var/folders/vx/w1k_44hj3_x7r7hcd0slm24m0000gn/T/xcrun_db-LviD6VTw' (errno=Operation not permitted)
+# runtime/cgo
+cc: error: couldn't create cache file '/var/folders/vx/w1k_44hj3_x7r7hcd0slm24m0000gn/T/xcrun_db-scZmpMB8' (errno=Operation not permitted)
+cc: error: couldn't create cache file '/var/folders/vx/w1k_44hj3_x7r7hcd0slm24m0000gn/T/xcrun_db-bsNyDs2z' (errno=Operation not permitted)
+# runtime/cgo
+cc: error: couldn't create cache file '/var/folders/vx/w1k_44hj3_x7r7hcd0slm24m0000gn/T/xcrun_db-bDzS5P8F' (errno=Operation not permitted)
+cc: error: couldn't create cache file '/var/folders/vx/w1k_44hj3_x7r7hcd0slm24m0000gn/T/xcrun_db-lIVbPRHe' (errno=Operation not permitted)
+# runtime/cgo
+cc: error: couldn't create cache file '/var/folders/vx/w1k_44hj3_x7r7hcd0slm24m0000gn/T/xcrun_db-jthGTBd2' (errno=Operation not permitted)
+cc: error: couldn't create cache file '/var/folders/vx/w1k_44hj3_x7r7hcd0slm24m0000gn/T/xcrun_db-0QLNyPQB' (errno=Operation not permitted)
+# runtime/cgo
+cc: error: couldn't create cache file '/var/folders/vx/w1k_44hj3_x7r7hcd0slm24m0000gn/T/xcrun_db-dFnwL2Ay' (errno=Operation not permitted)
+cc: error: couldn't create cache file '/var/folders/vx/w1k_44hj3_x7r7hcd0slm24m0000gn/T/xcrun_db-kwG57Iye' (errno=Operation not permitted)

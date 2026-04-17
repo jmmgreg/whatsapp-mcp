@@ -1,0 +1,7 @@
+./attrs.go
+./decoder.go
+./encoder.go
+./errors.go
+./node.go
+./unpack.go
+./xml.go

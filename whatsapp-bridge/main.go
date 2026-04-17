@@ -24,12 +24,158 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waSyncAction"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 )
+
+// handleLiveCall persists a stub/ringing row from a live event. Fields that
+// the event doesn't carry (duration, final result) are filled in later by
+// CallTerminate or by the next history-sync record for the same CallID.
+// Older whatsmeow's BasicCallMeta has no GroupJID — we derive isGroup from
+// the From JID's server and from the CallOfferNotice.Type string.
+func handleLiveCall(store *MessageStore, meta types.BasicCallMeta, isVideo, isGroup bool, result string, logger waLog.Logger) {
+	if meta.CallID == "" {
+		return
+	}
+	chatJID := meta.From.String()
+	// Ringing events are incoming by construction: whatsmeow emits them for
+	// calls to the authenticated device.
+	isIncoming := true
+	if err := store.StoreCall(
+		meta.CallID, chatJID, meta.CallCreator.String(),
+		meta.Timestamp, 0, isIncoming, isVideo, isGroup, result,
+	); err != nil {
+		logger.Warnf("Failed to store live call %s: %v", meta.CallID, err)
+	}
+}
+
+// handleCallTerminate updates the call row with the final result. Reasons we've
+// observed: "timeout" (nobody picked up), "accept" (answered — duration is
+// still 0 until history sync catches up), "reject" (declined). Anything else
+// is stored verbatim so diagnostics don't swallow information.
+func handleCallTerminate(store *MessageStore, v *events.CallTerminate, logger waLog.Logger) {
+	if v.CallID == "" {
+		return
+	}
+	result := v.Reason
+	switch v.Reason {
+	case "timeout":
+		result = "missed"
+	case "reject":
+		result = "rejected"
+	case "accept":
+		result = "connected"
+	}
+	isGroup := strings.HasSuffix(v.From.String(), "@g.us")
+	if err := store.StoreCall(
+		v.CallID, v.From.String(), v.CallCreator.String(),
+		v.Timestamp, 0, true, false, isGroup, result,
+	); err != nil {
+		logger.Warnf("Failed to update call %s on terminate: %v", v.CallID, err)
+	}
+}
+
+// handleAppStateCallLog persists a call-log mutation received via app-state
+// sync. This is the single path that captures *outgoing* calls — the phone
+// records the call locally, then WhatsApp propagates the new row to every
+// linked device as an app-state mutation. Same CallLogRecord shape as
+// history sync, so we reuse the enum mapping and schema.
+func handleAppStateCallLog(client *whatsmeow.Client, store *MessageStore, v *events.AppState, logger waLog.Logger) {
+	action := v.GetCallLogAction()
+	if action == nil {
+		return // unrelated app-state mutation (contact, mute, label, …)
+	}
+	rec := action.GetCallLogRecord()
+	if rec == nil || rec.GetCallID() == "" {
+		return
+	}
+	// Resolve every JID via whatsmeow's lid_map so @lid-keyed call logs get
+	// rewritten to the phone-JID form used by the address-book contacts.
+	// Without this, name lookup hits the LID contact row (push_name only)
+	// instead of the address-book row (full_name like "Maman Nouveau").
+	creator := resolveLID(client, rec.GetCallCreatorJID())
+	groupJID := resolveLID(client, rec.GetGroupJID())
+	isGroup := groupJID != ""
+	// chat_jid should be the *conversation* JID — the OTHER party, so a
+	// query for "calls with Maman" finds both incoming and outgoing.
+	// For incoming 1:1: the creator IS the other party.
+	// For outgoing 1:1: creator is us; the other party is in participants.
+	// For groups: always the group JID.
+	chatJID := groupJID
+	if chatJID == "" {
+		if rec.GetIsIncoming() {
+			chatJID = creator
+		} else {
+			for _, p := range rec.GetParticipants() {
+				if u := resolveLID(client, p.GetUserJID()); u != "" && u != creator {
+					chatJID = u
+					break
+				}
+			}
+			if chatJID == "" {
+				chatJID = creator // fallback: empty participants list
+			}
+		}
+	}
+	if err := store.StoreCall(
+		rec.GetCallID(),
+		chatJID,
+		creator,
+		time.Unix(rec.GetStartTime(), 0),
+		rec.GetDuration(),
+		rec.GetIsIncoming(),
+		rec.GetIsVideo(),
+		isGroup,
+		callResultToString(rec.GetCallResult()),
+	); err != nil {
+		logger.Warnf("Failed to store call log from app-state %s: %v", rec.GetCallID(), err)
+	} else {
+		direction := "outgoing"
+		if rec.GetIsIncoming() {
+			direction = "incoming"
+		}
+		fmt.Printf("Stored %s %s call (%s, %ds) via app-state sync\n",
+			direction, callResultToString(rec.GetCallResult()),
+			map[bool]string{true: "video", false: "voice"}[rec.GetIsVideo()],
+			rec.GetDuration())
+	}
+}
+
+// callResultToString maps a whatsmeow CallResult enum to a lowercase string we
+// store in the `result` column. Matches what WhatsApp's proto expresses but in
+// a form that's easy to filter on (`WHERE result = 'missed'`).
+func callResultToString(r waSyncAction.CallLogRecord_CallResult) string {
+	switch r {
+	case waSyncAction.CallLogRecord_CONNECTED:
+		return "connected"
+	case waSyncAction.CallLogRecord_REJECTED:
+		return "rejected"
+	case waSyncAction.CallLogRecord_CANCELLED:
+		return "cancelled"
+	case waSyncAction.CallLogRecord_ACCEPTEDELSEWHERE:
+		return "accepted_elsewhere"
+	case waSyncAction.CallLogRecord_MISSED:
+		return "missed"
+	case waSyncAction.CallLogRecord_INVALID:
+		return "invalid"
+	case waSyncAction.CallLogRecord_UNAVAILABLE:
+		return "unavailable"
+	case waSyncAction.CallLogRecord_UPCOMING:
+		return "upcoming"
+	case waSyncAction.CallLogRecord_FAILED:
+		return "failed"
+	case waSyncAction.CallLogRecord_ABANDONED:
+		return "abandoned"
+	case waSyncAction.CallLogRecord_ONGOING:
+		return "ongoing"
+	default:
+		return "unknown"
+	}
+}
 
 // Message represents a chat message for our client
 type Message struct {
@@ -84,6 +230,26 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+
+		-- Calls table (voice/video call log). Populated from two sources:
+		-- 1. History sync's CallLogRecords — retroactive, includes past calls
+		--    synced from the phone's native call log.
+		-- 2. Live whatsmeow events (CallOfferNotice / CallTerminate / CallReject)
+		--    — real-time for calls that ring while the bridge is running.
+		-- Both paths upsert on id (the CallID), so a call handled live is later
+		-- overwritten by the authoritative history-sync row without duplicating.
+		CREATE TABLE IF NOT EXISTS calls (
+			id TEXT PRIMARY KEY,
+			chat_jid TEXT,
+			from_jid TEXT,
+			timestamp TIMESTAMP,
+			duration_sec INTEGER DEFAULT 0,
+			is_incoming BOOLEAN,
+			is_video BOOLEAN,
+			is_group BOOLEAN,
+			result TEXT
+		);
+		CREATE INDEX IF NOT EXISTS idx_calls_timestamp ON calls(timestamp);
 	`)
 	if err != nil {
 		db.Close()
@@ -120,6 +286,21 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+	)
+	return err
+}
+
+// StoreCall upserts a call log row. Called from both history sync (authoritative)
+// and live event handlers; INSERT OR REPLACE on id lets the later path win.
+func (store *MessageStore) StoreCall(id, chatJID, fromJID string, ts time.Time, durationSec int64, isIncoming, isVideo, isGroup bool, result string) error {
+	if id == "" {
+		return nil // nothing to key on
+	}
+	_, err := store.db.Exec(
+		`INSERT OR REPLACE INTO calls
+		(id, chat_jid, from_jid, timestamp, duration_sec, is_incoming, is_video, is_group, result)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, chatJID, fromJID, ts, durationSec, isIncoming, isVideo, isGroup, result,
 	)
 	return err
 }
@@ -845,6 +1026,34 @@ func main() {
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
 
+		case *events.AppState:
+			// App-state sync delivers ongoing mutations — including call-log
+			// updates that the phone pushes when the user makes an OUTGOING
+			// call. This is the only way to capture calls initiated on a
+			// linked device (live CallOffer/Terminate are incoming-only).
+			// See whatsmeow/appstate/keys.go IndexCallLog.
+			handleAppStateCallLog(client, messageStore, v, logger)
+
+		case *events.CallOffer:
+			// Incoming 1:1 call is ringing. Record a stub row that CallTerminate
+			// or the next history sync will flesh out with duration/result.
+			handleLiveCall(messageStore, v.BasicCallMeta, false /* isVideo unknown here */, false /* 1:1 */, "ringing", logger)
+
+		case *events.CallOfferNotice:
+			// Same as CallOffer but carries media-type and a "group" marker.
+			isGroup := v.Type == "group" || strings.HasSuffix(v.From.String(), "@g.us")
+			handleLiveCall(messageStore, v.BasicCallMeta, v.Media == "video", isGroup, "ringing", logger)
+
+		case *events.CallTerminate:
+			// Final state for a live call. Reason tells us how it ended — we
+			// normalize common reasons to the same result strings used by the
+			// history-sync path so queries are uniform.
+			handleCallTerminate(messageStore, v, logger)
+
+		case *events.CallReject:
+			// Explicit rejection from the other side (1:1 calls).
+			handleLiveCall(messageStore, v.BasicCallMeta, false, false, "rejected", logger)
+
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
 
@@ -1008,6 +1217,41 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 // Handle history sync events
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
 	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
+
+	// Persist call log records from the history sync. WhatsApp pushes these
+	// from the phone's native call log — this is how we backfill calls that
+	// happened before the bridge was running. Same record may arrive in
+	// multiple sync batches; StoreCall uses INSERT OR REPLACE on call id.
+	for _, rec := range historySync.Data.GetCallLogRecords() {
+		callID := rec.GetCallID()
+		if callID == "" {
+			continue
+		}
+		creatorJID := rec.GetCallCreatorJID()
+		groupJID := rec.GetGroupJID()
+		isGroup := groupJID != ""
+		chatJID := groupJID
+		if chatJID == "" {
+			chatJID = creatorJID // 1:1 call — chat is with the counterparty
+		}
+		ts := time.Unix(rec.GetStartTime(), 0)
+		if err := messageStore.StoreCall(
+			callID,
+			chatJID,
+			creatorJID,
+			ts,
+			rec.GetDuration(),
+			rec.GetIsIncoming(),
+			rec.GetIsVideo(),
+			isGroup,
+			callResultToString(rec.GetCallResult()),
+		); err != nil {
+			logger.Warnf("Failed to store call log %s: %v", callID, err)
+		}
+	}
+	if n := len(historySync.Data.GetCallLogRecords()); n > 0 {
+		fmt.Printf("Synced %d call log records\n", n)
+	}
 
 	syncedCount := 0
 	for _, conversation := range historySync.Data.Conversations {

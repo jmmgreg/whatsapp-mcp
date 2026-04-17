@@ -1,0 +1,6 @@
+./FingerprintProtocol.pb.go
+./JSONSerializer.go
+./LocalStorageProtocol.pb.go
+./ProtoBufferSerializer.go
+./Serializer.go
+./WhisperTextProtocol.pb.go
