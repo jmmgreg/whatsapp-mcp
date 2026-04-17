@@ -23,6 +23,56 @@ def _resolve_bridge_url() -> str:
 
 WHATSAPP_API_BASE_URL = _resolve_bridge_url()
 
+
+# -------- Ignore filter (optional) --------
+# Loads the same JSON schema as the Go bridge's --ignore-config. Path precedence:
+# IGNORE_CONFIG_PATH env var → no filter. Config is re-read on every call so
+# edits to the file take effect immediately without restarting the MCP server.
+
+
+def _load_filter_config() -> dict:
+    """Return a dict with keys ignoreArchived, ignoreMuted, ignoredJids.
+
+    Empty dict means "no filtering" — callers treat that as permissive.
+    """
+    path = os.environ.get("IGNORE_CONFIG_PATH", "").strip()
+    if not path:
+        return {}
+    try:
+        with open(path, "r") as f:
+            cfg = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return {
+        "ignoreArchived": bool(cfg.get("ignoreArchived")),
+        "ignoreMuted": bool(cfg.get("ignoreMuted")),
+        "ignoredJids": [j for j in cfg.get("ignoredJids", []) if isinstance(j, str) and j],
+    }
+
+
+def _chat_filter_clauses(cfg: dict, chat_alias: str = "chats") -> Tuple[List[str], List[object]]:
+    """Build SQL WHERE fragments that exclude filtered chats.
+
+    Returns (clauses, params) to be AND-joined into the caller's query. The
+    alias lets callers with a different table alias (e.g. JOIN aliases) use
+    the same helper.
+    """
+    clauses: List[str] = []
+    params: List[object] = []
+    if not cfg:
+        return clauses, params
+
+    if cfg.get("ignoreArchived"):
+        clauses.append(f"({chat_alias}.is_archived = 0 OR {chat_alias}.is_archived IS NULL)")
+    if cfg.get("ignoreMuted"):
+        clauses.append(f"({chat_alias}.is_muted = 0 OR {chat_alias}.is_muted IS NULL)")
+    jids = cfg.get("ignoredJids") or []
+    if jids:
+        placeholders = ",".join("?" for _ in jids)
+        clauses.append(f"{chat_alias}.jid NOT IN ({placeholders})")
+        params.extend(jids)
+    return clauses, params
+
 @dataclass
 class Message:
     timestamp: datetime
@@ -156,7 +206,12 @@ def list_messages(
         query_parts.append("JOIN chats ON messages.chat_jid = chats.jid")
         where_clauses = []
         params = []
-        
+
+        # Apply ignore filter (no-op if IGNORE_CONFIG_PATH is unset or empty).
+        _filter_clauses, _filter_params = _chat_filter_clauses(_load_filter_config(), "chats")
+        where_clauses.extend(_filter_clauses)
+        params.extend(_filter_params)
+
         # Add filters
         if after:
             try:
@@ -361,11 +416,16 @@ def list_chats(
             
         where_clauses = []
         params = []
-        
+
+        # Apply ignore filter (no-op if IGNORE_CONFIG_PATH is unset or empty).
+        _filter_clauses, _filter_params = _chat_filter_clauses(_load_filter_config(), "chats")
+        where_clauses.extend(_filter_clauses)
+        params.extend(_filter_params)
+
         if query:
             where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
             params.extend([f"%{query}%", f"%{query}%"])
-            
+
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
             
