@@ -174,6 +174,36 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	return chats, nil
 }
 
+// resolveLID converts an @lid JID string to a phone-based @s.whatsapp.net JID string
+// using whatsmeow's LID map. Returns the input unchanged if it's not a LID JID,
+// if parsing fails, or if no mapping exists.
+func resolveLID(client *whatsmeow.Client, jidStr string) string {
+	if !strings.Contains(jidStr, "@lid") {
+		return jidStr
+	}
+	jid, err := types.ParseJID(jidStr)
+	if err != nil || jid.Server != types.HiddenUserServer {
+		return jidStr
+	}
+	pnJID, err := client.Store.LIDs.GetPNForLID(context.Background(), jid)
+	if err != nil || pnJID.IsEmpty() {
+		return jidStr
+	}
+	return pnJID.String()
+}
+
+// canonicalizeSender ensures a sender string is stored in full JID form.
+// If sender already contains "@", returns it unchanged (caller is responsible
+// for running it through resolveLID first if needed). Otherwise appends
+// "@s.whatsapp.net" so the sender column stays consistent across code paths.
+// Empty string is returned unchanged.
+func canonicalizeSender(sender string) string {
+	if sender == "" || strings.Contains(sender, "@") {
+		return sender
+	}
+	return sender + "@s.whatsapp.net"
+}
+
 // Extract text content from a message
 func extractTextContent(msg *waProto.Message) string {
 	if msg == nil {
@@ -412,9 +442,11 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
-	// Save message to database
-	chatJID := msg.Info.Chat.String()
-	sender := msg.Info.Sender.User
+	// Save message to database — always store fully-qualified JIDs (and resolve
+	// @lid JIDs to their phone-based form) so chat/sender keys stay consistent
+	// across handleMessage and handleHistorySync.
+	chatJID := resolveLID(client, msg.Info.Chat.String())
+	sender := canonicalizeSender(resolveLID(client, msg.Info.Sender.String()))
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
@@ -643,7 +675,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -824,14 +856,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -997,7 +1029,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -1012,7 +1044,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
@@ -1040,9 +1072,9 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			continue
 		}
 
-		chatJID := *conversation.ID
+		chatJID := resolveLID(client, *conversation.ID)
 
-		// Try to parse the JID
+		// Try to parse the (potentially resolved) JID
 		jid, err := types.ParseJID(chatJID)
 		if err != nil {
 			logger.Warnf("Failed to parse JID %s: %v", chatJID, err)
@@ -1104,7 +1136,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
-				// Determine sender
+				// Determine sender — always store full JID form, with @lid resolved.
 				var sender string
 				isFromMe := false
 				if msg.Message.Key != nil {
@@ -1112,14 +1144,14 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 						isFromMe = *msg.Message.Key.FromMe
 					}
 					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
-						sender = *msg.Message.Key.Participant
+						sender = canonicalizeSender(resolveLID(client, *msg.Message.Key.Participant))
 					} else if isFromMe {
-						sender = client.Store.ID.User
+						sender = client.Store.ID.String()
 					} else {
-						sender = jid.User
+						sender = jid.String()
 					}
 				} else {
-					sender = jid.User
+					sender = jid.String()
 				}
 
 				// Store message
